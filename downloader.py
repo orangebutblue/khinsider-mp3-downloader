@@ -1,106 +1,144 @@
 import os
+import re
 import urllib.parse as urlparse
-import urllib.request as urllib2, json
+import urllib.request as urllib2
 from bs4 import BeautifulSoup
 
 BASE_URL = 'https://downloads.khinsider.com'
 
-def validate_url (url):
-	if '//downloads.khinsider.com/game-soundtracks/album/' not in url:
-		return False
-	return True
 
-def fetch_from_url (url):
-	valid = validate_url(url)
-	if not valid:
-		print('[error] Invalid url: ' + url)
-		return
-	print('[info] Url found: ' + url)
+def safe_url(url):
+    return urlparse.quote(url, safe=':/?&=%')
 
-	base_dir = 'downloads'
-	url_parts = url.split('/')
-	dir_name = base_dir + '/' + url_parts[len(url_parts) - 1]
 
-	# Create directories
-	if not os.path.exists(base_dir):
-		print('[info] creating directory: ' + base_dir)
-		os.makedirs(base_dir)
-	if not os.path.exists(dir_name):
-		print ('[info] creating directory: ' + dir_name)
-		os.makedirs(dir_name)
+def sanitize_filename(name):
+    name = re.sub(r'[<>:"/\\|?*\r\n]+', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    if len(name) > 80:
+        name = name[:80].rstrip()
+    return name
 
-	print('[info] crawling for links...')
 
-	soup = BeautifulSoup(urllib2.urlopen(url))
+def validate_url(url):
+    return '//downloads.khinsider.com/game-soundtracks/album/' in url
 
-	song_list = soup.find(id="songlist")
-	anchors = song_list.find_all('a')
 
-	# href (string) -> song name (string)
-	songMap = {}
+def clean_song_title(raw_title):
+    """
+    Removes album/game info and leftover words like 'MP3', 'OST', 'Download', etc.
+    Example input:
+      'Stephanie\'s Visit (Extended) MP3 - Kingdom Come Deliverance – OST Atmospheres &'
+    Output:
+      'Stephanie\'s Visit (Extended)'
+    """
+    # Split before " MP3" or " OST" or " Download"
+    raw_title = re.split(r'\b(?:MP3|OST|Download)\b', raw_title, 1)[0]
+    # Remove trailing dashes or junk
+    raw_title = re.sub(r'[-–]+$', '', raw_title).strip()
+    return raw_title
 
-	# Acquire links
-	for anchor in anchors:
-		href = anchor.get('href')
-		if href and 'mp3' in href:
-			href = BASE_URL + href
-			if href not in songMap:
-				songMap[href] = anchor.string
-	if not songMap:
-		print('[error] No links found for the url. Double check that the url is correct and try again.')
-		print('[error] url: ' + url)
-		return
 
-	print('[info] ' + str(len(songMap)) + ' links acquired')
+def fetch_from_url(url):
+    url = url.strip()
+    if not url:
+        print('[error] Invalid url: (empty line)')
+        return
+    if not validate_url(url):
+        print('[error] Invalid url: ' + url)
+        return
 
-	# Map so we don't download duplicate links on the page
-	downloaded_mp3s = {}
+    print('[info] Url found: ' + url)
 
-	# http://stackoverflow.com/questions/22676/how-do-i-download-a-file-over-http-using-python
-	# Iterate through links, grab the mp3s, and download them
-	for href, song_name in songMap.items():
-		link_soup = BeautifulSoup(urllib2.urlopen(href))
-		audio = link_soup.find('audio')
-		mp3_url = audio.get('src')
-		if mp3_url not in downloaded_mp3s:
-			downloaded_mp3s[mp3_url] = True
-			parts = mp3_url.split('/')
-			file_name = song_name + '.mp3'
+    base_dir = 'downloads'
+    album_name = url.split('/')[-1]
+    dir_name = os.path.join(base_dir, album_name)
 
-			mp3file = urllib2.urlopen(mp3_url)
+    if not os.path.exists(base_dir):
+        os.makedirs(base_dir)
+    if not os.path.exists(dir_name):
+        os.makedirs(dir_name)
 
-			# get file size
-			meta = mp3file.info()
-			file_size = float(meta.get("Content-Length")) / 1000000
+    print('[info] crawling for links...')
+    response = urllib2.urlopen(safe_url(url))
+    soup = BeautifulSoup(response, features="lxml")
 
-			file_on_disk_path = dir_name + '/' + file_name
-			# check if file already exists
-			file_already_downloaded = False
-			if os.path.exists(file_on_disk_path):
-				stat = os.stat(file_on_disk_path)
-				file_already_downloaded = round(float(stat.st_size) / 1000000, 2) == round(file_size, 2)
+    song_links = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if href.lower().endswith('.mp3') and '/game-soundtracks/album/' in href:
+            full = BASE_URL + href
+            if full not in song_links:
+                song_links.append(full)
 
-			# It exists but isn't already the same size
-			if not file_already_downloaded:
-				print('[downloading] ' + file_name + ' [%.2f' % file_size + 'MB]')
+    if not song_links:
+        print('[error] Could not find any songs on page.')
+        return
 
-				with open(file_on_disk_path,'wb') as output:
-					output.write(mp3file.read())
-					print('[done] "' + file_name + '"')
-			else:
-				print('[skipping] "' + file_name + '"" already downloaded.')
+    print(f'[info] {len(song_links)} links acquired')
+
+    downloaded_mp3s = {}
+    track_num = 1
+
+    for song_url in song_links:
+        try:
+            song_page = urllib2.urlopen(safe_url(song_url))
+            link_soup = BeautifulSoup(song_page, features="lxml")
+            audio = link_soup.find('audio')
+            if not audio:
+                print(f'[warn] No audio found for: {song_url}')
+                continue
+
+            mp3_url = audio.get('src')
+            if not mp3_url:
+                print(f'[warn] Missing mp3 src for: {song_url}')
+                continue
+
+            if mp3_url in downloaded_mp3s:
+                continue
+            downloaded_mp3s[mp3_url] = True
+
+            title_tag = link_soup.find('title')
+            raw_title = title_tag.text if title_tag else os.path.basename(mp3_url)
+
+            song_name = clean_song_title(raw_title)
+            song_name = sanitize_filename(song_name)
+            if not song_name:
+                song_name = f"track_{track_num:03d}"
+
+            file_name = f"{track_num:03d} - {song_name}.mp3"
+            track_num += 1
+
+            file_on_disk_path = os.path.join(dir_name, file_name)
+
+            mp3file = urllib2.urlopen(safe_url(mp3_url))
+            meta = mp3file.info()
+            file_size = float(meta.get("Content-Length", 0)) / 1_000_000
+
+            if os.path.exists(file_on_disk_path):
+                stat = os.stat(file_on_disk_path)
+                same_size = round(stat.st_size / 1_000_000, 2) == round(file_size, 2)
+                if same_size:
+                    print(f'[skipping] "{file_name}" already downloaded.')
+                    continue
+
+            print(f'[downloading] {file_name} [{file_size:.2f}MB]')
+            with open(file_on_disk_path, 'wb') as output:
+                output.write(mp3file.read())
+            print(f'[done] "{file_name}"')
+
+        except Exception as e:
+            print(f'[error] Failed to download from {song_url}: {e}')
+
 
 input_file_name = 'inputs.txt'
 if os.path.exists(input_file_name):
-	print('[info] Input file found. Parsing for links...')
-	file = open(input_file_name, 'r')
-	for line in file:
-		fetch_from_url(line)
+    print('[info] Input file found. Parsing for links...')
+    with open(input_file_name, 'r') as file:
+        for line in file:
+            fetch_from_url(line)
 else:
-	print('Please input link in quotes to album on khinsider.')
-	print('Example input (including quotes): \'http://downloads.khinsider.com/game-soundtracks/album/disgaea-4-a-promise-unforgotten-soundtrack\'')
-	url = input('Url: ')
-	fetch_from_url(url)
-
-# For testing
-# url = 'http://downloads.khinsider.com/game-soundtracks/album/disgaea-4-a-promise-unforgotten-soundtrack'
+    print('Please input link in quotes to album on khinsider.')
+    print('Example input:')
+    print('  http://downloads.khinsider.com/game-soundtracks/album/disgaea-4-a-promise-unforgotten-soundtrack')
+    url = input('Url: ')
+    fetch_from_url(url)
